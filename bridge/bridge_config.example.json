@@ -1,0 +1,8 @@
+{
+  "email": "bridge@your-company.com",
+  "password": "كلمة-مرور-حساب-الجسر",
+  "work_start": "08:00",
+  "grace_min": 15,
+  "work_end": "17:00",
+  "ot_after": "17:00"
+}

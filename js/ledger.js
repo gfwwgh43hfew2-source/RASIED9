@@ -1,0 +1,343 @@
+/* ============================================================================
+   Ledger — طبقة الدفتر المشتركة (أرصدة العملاء/الموردين + حركات الخزائن)
+   مستوحاة من منطق رولكس: الرصيد يُشتق من الحركات ولا يُعتمد على رقم مخزَّن.
+   عميل : الرصيد = افتتاحي + مبيعات − مردودات − تحصيلات − خصومات ± تسويات
+   مورد : الرصيد = افتتاحي + مشتريات − مردودات − مدفوعات − خصومات ± تسويات
+   ========================================================================== */
+(function () {
+  var N = function (x) { return Number(x) || 0; };
+  var today = function () { return new Date().toISOString().slice(0, 10); };
+  var dayOf = function (r) { return String(r.date || r.created_at || "").slice(0, 10); };
+
+  var KIND_LABEL = {
+    sale: "فاتورة بيع", purchase: "فاتورة شراء", sale_return: "مردود بيع", purchase_return: "مردود شراء",
+    receipt: "تحصيل", payment: "سداد", discount: "خصم", settlement: "تسوية", opening: "رصيد افتتاحي",
+  };
+
+  /* ---------- كشف حساب طرف ---------- */
+  // inc = يزيد الرصيد (مدين للعميل / دائن للمورد) ، dec = ينقصه
+  // pre (اختياري): {party, docs, rets, pays, txns} محمّلة مسبقًا (تستعملها recomputeAll لتجنّب إعادة الجلب)
+  async function statement(type, id, from, to, pre) {
+    var isC = type === "customer";
+    var key = isC ? "customer_id" : "supplier_id";
+    var d = pre ? [pre.party, pre.docs, pre.rets, pre.pays, pre.txns] : await Promise.all([
+      DB.get(isC ? "customers" : "suppliers", id),
+      DB.listWhere(isC ? "sales" : "purchases", key, id),
+      DB.listWhere(isC ? "sale_returns" : "purchase_returns", key, id),
+      DB.listWhere("payments", "party_id", id),
+      DB.listWhere("party_txns", "party_id", id),
+    ]);
+    var party = d[0] || {};
+    var all = [];
+    d[1].filter(function (r) { return r[key] === id && r.status !== "void"; }).forEach(function (r) {
+      all.push({ date: dayOf(r), at: r.created_at, kind: isC ? "sale" : "purchase", ref: r.number, book: r.book_no || "", rank: 0, desc: r.notes || "", inc: N(r.total), dec: 0 });
+    });
+    d[2].filter(function (r) { return r[key] === id && r.status !== "void"; }).forEach(function (r) {
+      all.push({ date: dayOf(r), at: r.created_at, kind: isC ? "sale_return" : "purchase_return", ref: r.number, rank: 2, desc: r.notes || "", inc: 0, dec: N(r.total) });
+    });
+    d[3].filter(function (r) { return r.party_type === type && r.party_id === id; }).forEach(function (r) {
+      all.push({ date: dayOf(r), at: r.created_at, kind: isC ? "receipt" : "payment", ref: "", rank: 3, desc: r.notes || "", inc: 0, dec: N(r.amount) });
+    });
+    d[4].filter(function (r) { return r.party_type === type && r.party_id === id; }).forEach(function (r) {
+      var up = r.direction === "inc";
+      all.push({ date: dayOf(r), at: r.created_at, kind: r.kind, ref: "", rank: 1, desc: r.notes || "", inc: up ? N(r.amount) : 0, dec: up ? 0 : N(r.amount) });
+    });
+    all.sort(function (a, b) {
+      if (a.date !== b.date) return a.date < b.date ? -1 : 1;           // التاريخ ثم: فاتورة ← تسوية/خصم ← مرتجع ← تحصيل (نفس ترتيب رولكس)
+      if ((a.rank || 0) !== (b.rank || 0)) return (a.rank || 0) - (b.rank || 0);
+      return String(a.at || "").localeCompare(String(b.at || ""));
+    });
+
+    var opening = N(party.opening_balance);
+    var run = opening, before = opening, rows = [], tin = 0, tdec = 0;
+    all.forEach(function (r) {
+      if (from && r.date < from) { before += r.inc - r.dec; run = before; return; }
+      if (to && r.date > to) return;
+      run += r.inc - r.dec; tin += r.inc; tdec += r.dec;
+      r.balance = run; rows.push(r);
+    });
+    var full = opening + all.reduce(function (s, r) { return s + r.inc - r.dec; }, 0);
+    return { party: party, opening: from ? before : opening, rows: rows, closing: run, totals: { inc: tin, dec: tdec }, full: full };
+  }
+
+  // قوائم الأسعار: نسبة تعديل على السعر الأساسي + أسعار مخصصة لأصناف بعينها
+  async function loadPriceList(id) {
+    if (!id) return null;
+    var lists = (await DB.list("price_lists")) || [];
+    var pl = lists.filter(function (l) { return l.id === id; })[0];
+    if (!pl || pl.active === false) return null;
+    var items = (await DB.listWhere("price_list_items", "price_list_id", id)) || [], over = {};
+    items.forEach(function (it) { over[it.product_id] = N(it.price); });
+    return { id: pl.id, name: pl.name, pct: N(pl.adjust_pct), over: over };
+  }
+  function priceWith(pl, p) {
+    var base = N(p.price);
+    if (!pl) return base;
+    if (pl.over[p.id] != null) return pl.over[p.id];
+    return Math.round(base * (1 + pl.pct / 100) * 100) / 100;
+  }
+  async function recompute(type, id) {
+    var s = await statement(type, id);
+    await DB.update(type === "customer" ? "customers" : "suppliers", id, { balance: s.full });
+    return s.full;
+  }
+  async function recomputeAll(type) {
+    var isC = type === "customer", key = isC ? "customer_id" : "supplier_id";
+    var d = await Promise.all([
+      DB.list(isC ? "customers" : "suppliers"), DB.list(isC ? "sales" : "purchases"),
+      DB.list(isC ? "sale_returns" : "purchase_returns"), DB.list("payments"), DB.list("party_txns"),
+    ]);
+    var group = function (arr, f) { var m = {}; arr.forEach(function (r) { var k = f(r); (m[k] = m[k] || []).push(r); }); return m; };
+    var docs = group(d[1], function (r) { return r[key]; }), rets = group(d[2], function (r) { return r[key]; });
+    var pays = group(d[3], function (r) { return r.party_id; }), txns = group(d[4], function (r) { return r.party_id; });
+    var list = d[0];
+    for (var i = 0; i < list.length; i += 10) {
+      await Promise.all(list.slice(i, i + 10).map(async function (p) {
+        var s = await statement(type, p.id, null, null, { party: p, docs: docs[p.id] || [], rets: rets[p.id] || [], pays: pays[p.id] || [], txns: txns[p.id] || [] });
+        await DB.update(isC ? "customers" : "suppliers", p.id, { balance: s.full });
+      }));
+    }
+    return list.length;
+  }
+
+  function newId() {
+    if (window.crypto && crypto.randomUUID) return crypto.randomUUID();
+    return "id-" + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+  }
+  async function journal(date, memo, source, dr, cr, amount) {
+    var number = await DB.nextNumber("journal_entries");
+    var eid = newId();
+    await DB.insertRows([
+      { table: "journal_entries", row: { id: eid, number: number, date: date, memo: memo, source: source } },
+      { table: "journal_lines", row: { entry_id: eid, account_id: dr, debit: amount, credit: 0 } },
+      { table: "journal_lines", row: { entry_id: eid, account_id: cr, debit: 0, credit: amount } },
+    ]);
+  }
+
+  // ---------- شجرة الحسابات ----------
+  // يرتّب الحسابات كشجرة (الأب ثم أبناؤه بالكود) ويُرجع [{a, level, hasKids}] — يتجاهل الأب المفقود/الدائري
+  function accountTree(list) {
+    var byId = {}, kids = {};
+    list.forEach(function (a) { byId[a.id] = a; });
+    list.forEach(function (a) {
+      var p = a.parent && a.parent !== a.id && byId[a.parent] ? a.parent : "";
+      (kids[p] = kids[p] || []).push(a);
+    });
+    var cmp = function (x, y) { return String(x.code || "").localeCompare(String(y.code || ""), "en", { numeric: true }); };
+    var out = [], seen = {};
+    (function walk(pid, level) {
+      (kids[pid] || []).sort(cmp).forEach(function (a) {
+        if (seen[a.id]) return; seen[a.id] = 1;
+        out.push({ a: a, level: level, hasKids: !!(kids[a.id] && kids[a.id].length) });
+        walk(a.id, level + 1);
+      });
+    })("", 0);
+    list.forEach(function (a) { if (!seen[a.id]) out.push({ a: a, level: 0, hasKids: false }); });   // حلقات مفقودة
+    return out;
+  }
+  // معرّفات كل أحفاد حساب (لمنع جعل الحساب تابعًا لنفسه/لأحد أبنائه)
+  function accountDescendants(list, id) {
+    var res = {}, stack = [id];
+    while (stack.length) {
+      var cur = stack.pop();
+      list.forEach(function (a) { if (a.parent === cur && !res[a.id]) { res[a.id] = 1; stack.push(a.id); } });
+    }
+    return res;
+  }
+
+  /* ---------- حركة خزينة ---------- */
+  // type: in | out | transfer_in | transfer_out | opening
+  async function treasuryMove(o) {
+    var sign = (o.type === "in" || o.type === "transfer_in" || o.type === "opening") ? 1 : -1;
+    var amount = N(o.amount);
+    if (amount <= 0) throw new Error("المبلغ غير صحيح");
+    // الخزينة (طازجة) وحركاتها فقط — بالتوازي — بدل تحميل حركات كل الخزائن
+    var r = await Promise.all([
+      DB.get("cash_registers", o.register_id, { fresh: true }),
+      DB.listWhere("cash_movements", "register_id", o.register_id),
+    ]);
+    var reg = r[0], mine = r[1];
+    if (!reg) throw new Error("الخزينة غير موجودة");
+    var seq = 0;
+    mine.forEach(function (m) { if (N(m.seq) > seq) seq = N(m.seq); });
+    if (!seq) seq = mine.length;
+    var row = {
+      seq: seq + 1, ref: o.ref || "", ptab_id: o.ptab_id || "",
+      register_id: o.register_id, type: o.type, kind: sign > 0 ? "in" : "out", amount: amount,
+      date: o.date || today(), notes: o.notes || "", tab_id: o.tab_id || "",
+      party_type: o.party_type || "", party_id: o.party_id || "",
+      grp: o.grp || "", counterpart: o.counterpart || "",
+    };
+    if (o.id) row.id = o.id;
+    var out = await Promise.all([
+      DB.insert("cash_movements", row),
+      DB.update("cash_registers", o.register_id, { balance: N(reg.balance) + sign * amount }),
+    ]);
+    return out[0];
+  }
+
+  // رصيد افتتاحي لخزينة: حركة + قيد (من الصندوق/إلى رأس المال) مرتبطين بـ jid — عشان الميزانية تطابق الخزينة
+  async function openingMove(regId, amount, date, regName) {
+    var rec = await treasuryMove({ register_id: regId, type: "opening", amount: amount, date: date, notes: "رصيد افتتاحي" });
+    var jn = await DB.nextNumber("journal_entries"), eid = newId();
+    await DB.insertRows([
+      { table: "journal_entries", row: { id: eid, number: jn, date: date, memo: "رصيد افتتاحي: " + (regName || ""), source: "cash" } },
+      { table: "journal_lines", row: { entry_id: eid, account_id: "a1", debit: N(amount), credit: 0 } },
+      { table: "journal_lines", row: { entry_id: eid, account_id: "a6", debit: 0, credit: N(amount) } },
+    ]);
+    await DB.update("cash_movements", rec.id, { jid: eid });
+    return rec;
+  }
+
+  async function transfer(fromId, toId, amount, date, notes) {
+    if (fromId === toId) throw new Error("اختر خزينتين مختلفتين");
+    var r = await Promise.all([DB.get("cash_registers", fromId, { fresh: true }), DB.get("cash_registers", toId, { fresh: true })]);
+    var a = r[0], b = r[1];
+    if (!a || !b) throw new Error("خزينة غير موجودة");
+    if (N(amount) > N(a.balance)) throw new Error("رصيد الخزينة المحوَّل منها غير كافٍ");
+    var grp = "tr" + Date.now().toString(36);
+    // الخزينتان مختلفتان فلا تعارض بين الحركتين
+    await Promise.all([
+      treasuryMove({ register_id: fromId, type: "transfer_out", amount: amount, date: date, grp: grp, counterpart: toId,
+        notes: "تحويل إلى " + b.name + (notes ? " — " + notes : "") }),
+      treasuryMove({ register_id: toId, type: "transfer_in", amount: amount, date: date, grp: grp, counterpart: fromId,
+        notes: "تحويل من " + a.name + (notes ? " — " + notes : "") }),
+    ]);
+  }
+
+  // رصيد سابق = الرصيد الحالي − صافي الحركات المسجلة (يحافظ على الأرصدة القديمة)
+  async function treasuryStatement(regId, from, to) {
+    var d = await Promise.all([DB.get("cash_registers", regId), DB.list("cash_movements")]);
+    var reg = d[0] || {};
+    var mv = d[1].filter(function (m) { return m.register_id === regId; });
+    mv.forEach(function (m) {
+      var plus = m.type ? (m.type === "in" || m.type === "transfer_in" || m.type === "opening") : m.kind === "in";
+      m._s = plus ? 1 : -1; m._d = dayOf(m);
+    });
+    mv.sort(function (a, b) {
+      return a._d === b._d ? String(a.created_at || "").localeCompare(String(b.created_at || "")) : (a._d < b._d ? -1 : 1);
+    });
+    var net = mv.reduce(function (s, m) { return s + m._s * N(m.amount); }, 0);
+    var base = N(reg.balance) - net;
+    var run = base, rows = [], tin = 0, tout = 0;
+    mv.forEach(function (m) {
+      var amt = N(m.amount);
+      if (from && m._d < from) { run += m._s * amt; base = run; return; }
+      if (to && m._d > to) return;
+      run += m._s * amt;
+      if (m._s > 0) tin += amt; else tout += amt;
+      rows.push({ m: m, inc: m._s > 0 ? amt : 0, out: m._s < 0 ? amt : 0, balance: run });
+    });
+    return { reg: reg, opening: base, rows: rows, closing: run, totals: { inc: tin, out: tout } };
+  }
+
+  /* ---------- تحصيل من عميل / سداد لمورد ---------- */
+  async function recordPayment(o) {
+    var isC = o.party_type === "customer";
+    var amount = N(o.amount);
+    if (amount <= 0) throw new Error("المبلغ غير صحيح");
+    var date = o.date || today();
+    var party = await DB.get(isC ? "customers" : "suppliers", o.party_id, { fresh: true });
+    if (!party) throw new Error("الطرف غير موجود");
+    var jobs = [DB.insert("payments", {
+      kind: isC ? "receipt" : "payment", party_type: o.party_type, party_id: o.party_id, amount: amount,
+      method: o.register_id ? "cash" : "bank", register_id: o.register_id || "", date: date, notes: o.notes || "",
+    })];
+    if (o.register_id) {
+      jobs.push(treasuryMove({
+        register_id: o.register_id, type: isC ? "in" : "out", amount: amount, date: date, tab_id: o.tab_id,
+        party_type: o.party_type, party_id: o.party_id,
+        notes: (isC ? "تحصيل من " : "سداد إلى ") + party.name + (o.notes ? " — " + o.notes : ""),
+      }));
+    }
+    jobs.push(isC ? journal(date, "تحصيل من " + party.name, "receipt", "a1", "a3", amount)
+                  : journal(date, "سداد إلى " + party.name, "payment", "a5", "a1", amount));
+    await Promise.all(jobs);
+    return recompute(o.party_type, o.party_id);
+  }
+
+  /* ---------- خصم / تسوية ---------- */
+  // kind: discount | settlement ; direction: inc | dec (الخصم دائمًا dec)
+  async function recordAdjustment(o) {
+    var isC = o.party_type === "customer";
+    var amount = N(o.amount);
+    if (amount <= 0) throw new Error("المبلغ غير صحيح");
+    var dir = o.kind === "discount" ? "dec" : (o.direction === "inc" ? "inc" : "dec");
+    var date = o.date || today();
+    var party = await DB.get(isC ? "customers" : "suppliers", o.party_id);
+    if (!party) throw new Error("الطرف غير موجود");
+    await DB.insert("party_txns", {
+      party_type: o.party_type, party_id: o.party_id, kind: o.kind, direction: dir, amount: amount, date: date, notes: o.notes || "",
+    });
+    var pa = isC ? "a3" : "a5", ctr = isC ? (o.kind === "discount" ? "a8" : "a7") : "a11";
+    var label = (o.kind === "discount" ? "خصم " : "تسوية ") + party.name;
+    var up = dir === "inc";
+    if (isC) { if (up) await journal(date, label, o.kind, pa, ctr, amount); else await journal(date, label, o.kind, ctr, pa, amount); }
+    else { if (up) await journal(date, label, o.kind, ctr, pa, amount); else await journal(date, label, o.kind, pa, ctr, amount); }
+    return recompute(o.party_type, o.party_id);
+  }
+
+  /* ---------- مودال نموذج موحّد بنفس تصميم النظام ---------- */
+  function modal(title, bodyHtml, onSubmit, submitLabel) {
+    var ov = document.createElement("div");
+    ov.className = "modal-overlay";
+    ov.innerHTML = '<div class="modal card"><h3 style="margin-top:0">' + title + '</h3><form id="f" class="stack">' + bodyHtml +
+      '<div class="row gap" style="justify-content:flex-end"><button type="button" class="ghost" id="cancel">إلغاء</button>' +
+      '<button class="primary" type="submit">' + (submitLabel || "حفظ") + '</button></div></form></div>';
+    document.body.appendChild(ov);
+    ov.querySelector("#cancel").onclick = function () { ov.remove(); };
+    ov.onclick = function (e) { if (e.target === ov) ov.remove(); };
+    ov.querySelector("#f").onsubmit = async function (e) {
+      e.preventDefault();
+      var btn = ov.querySelector("button.primary"); btn.disabled = true;
+      try { await onSubmit(ov); } catch (err) { UI.toast(err.message || "خطأ", true); btn.disabled = false; }
+    };
+    return ov;
+  }
+  var esc = function (s) { return String(s == null ? "" : s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); };
+  var val = function (id) { return document.getElementById(id).value; };
+
+  // ميزان مراجعة الأطراف: لكل طرف رصيد أول الفترة + حركة + رصيد آخر الفترة (تحميل واحد للبيانات)
+  async function trial(type, from, to) {
+    var isC = type === "customer", key = isC ? "customer_id" : "supplier_id";
+    var d = await Promise.all([
+      DB.list(isC ? "customers" : "suppliers"), DB.list(isC ? "sales" : "purchases"),
+      DB.list(isC ? "sale_returns" : "purchase_returns"), DB.list("payments"), DB.list("party_txns"),
+    ]);
+    var map = {};
+    d[0].forEach(function (p) {
+      map[p.id] = { party: p, opening: N(p.opening_balance), before: 0, docs: 0, ret: 0, pay: 0, disc: 0, setl: 0, net: 0, last: "" };
+    });
+    function add(id, date, field, amt, signInc) {
+      var m = map[id]; if (!m) return;
+      var delta = signInc ? amt : -amt;
+      if (from && date < from) { m.before += delta; return; }
+      if (to && date > to) return;
+      m[field] += (field === "setl" ? delta : amt); m.net += delta;
+      if (date > m.last) m.last = date;
+    }
+    d[1].forEach(function (r) { if (r.status !== "void") add(r[key], dayOf(r), "docs", N(r.total), true); });
+    d[2].forEach(function (r) { if (r.status !== "void") add(r[key], dayOf(r), "ret", N(r.total), false); });
+    d[3].forEach(function (r) { if (r.party_type === type) add(r.party_id, dayOf(r), "pay", N(r.amount), false); });
+    d[4].forEach(function (r) {
+      if (r.party_type !== type) return;
+      if (r.kind === "discount") add(r.party_id, dayOf(r), "disc", N(r.amount), false);
+      else add(r.party_id, dayOf(r), "setl", N(r.amount), r.direction === "inc");
+    });
+    return Object.keys(map).map(function (id) {
+      var m = map[id];
+      // التسوية: تُحتسب إشارتها (زيادة +، نقص −) في صافي الحركة
+      m.start = m.opening + m.before; m.end = m.start + m.net;
+      return m;
+    });
+  }
+
+  window.Ledger = {
+    trial: trial,
+    modal: modal, esc: esc, val: val,
+    loadPriceList: loadPriceList, priceWith: priceWith,
+    KIND_LABEL: KIND_LABEL, accountTree: accountTree, accountDescendants: accountDescendants, statement: statement, recompute: recompute, recomputeAll: recomputeAll,
+    treasuryMove: treasuryMove, openingMove: openingMove, transfer: transfer, treasuryStatement: treasuryStatement,
+    recordPayment: recordPayment, recordAdjustment: recordAdjustment, today: today,
+  };
+})();
