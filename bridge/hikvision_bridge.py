@@ -43,9 +43,9 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════
 #                    إعدادات الجهاز — عدّلها
 # ═══════════════════════════════════════════════════════════
-DEVICE_IP = os.environ.get("HIK_IP", "192.168.1.64")   # IP جهاز البصمة
+DEVICE_IP = os.environ.get("HIK_IP", "192.168.0.64")   # IP جهاز البصمة
 DEVICE_USER = os.environ.get("HIK_USER", "admin")
-DEVICE_PASS = os.environ.get("HIK_PASS", "admin12345")  # باسورد الجهاز
+DEVICE_PASS = os.environ.get("HIK_PASS", "123456asdA")  # باسورد الجهاز
 POLL_SECONDS = int(os.environ.get("HIK_POLL", "5"))    # كل كام ثانية نسحب
 LOOKBACK_HOURS = int(os.environ.get("HIK_LOOKBACK", "24"))  # نسحب آخر كام ساعة عند البدء
 HTTP_HOST = "127.0.0.1"
@@ -73,18 +73,64 @@ def log(msg: str) -> None:
     print(f"[{ts}] {msg}", flush=True)
 
 
-def device_get(path: str, timeout: int = 8):
+class DeviceAuthError(Exception):
+    """الجهاز رفض الدخول (401) — لا فائدة من تجربة صيغ أخرى. wait = ثوانٍ ننتظرها قبل أي محاولة جديدة."""
+    def __init__(self, msg: str, wait: int = 600):
+        super().__init__(msg)
+        self.wait = wait
+
+
+def _xml_tag(text: str, tag: str) -> str:
+    m = re.search(rf"<{tag}>([^<]*)</{tag}>", text or "")
+    return m.group(1).strip() if m else ""
+
+
+def _auth_error(r) -> "DeviceAuthError":
+    """يقرأ حالة القفل وعدد المحاولات المتبقية من رد الجهاز ويقرّر مدة الانتظار."""
+    body = r.text or ""
+    lock = _xml_tag(body, "lockStatus")
+    unlock = _xml_tag(body, "unlockTime")
+    retry = _xml_tag(body, "retryLoginTime")
+    try:
+        unlock_s = int(unlock or 0)
+    except ValueError:
+        unlock_s = 0
+    if lock.lower() == "lock":
+        wait = max(unlock_s, 60) + 60
+        msg = (f"الجهاز مقفول مؤقتاً بعد محاولات دخول فاشلة — يُفتح بعد حوالي {unlock_s} ثانية. "
+               f"سيُعاد المحاولة بعد {wait} ثانية دون إرسال أي طلب في الأثناء.")
+    else:
+        wait = 900
+        msg = (f"الجهاز رفض الدخول (401). المحاولات المتبقية قبل القفل: {retry or 'غير معروف'}. "
+               f"تحقق من DEVICE_PASS. سنتوقف 15 دقيقة كي لا نستهلك المحاولات.")
+    if not body.strip():
+        msg += " (الجهاز لم يرسل أي تفاصيل — غالباً قفل مؤقت)"
+        wait = max(wait, 900)
+    return DeviceAuthError(msg, wait)
+
+
+def _request(method: str, path: str, timeout: int, **kw):
+    """طلب بمصادقة Digest جديدة في كل مرة (تجنّب إعادة استخدام nonce قديم)، وإعادة محاولة واحدة عند 401."""
     url = BASE + path
-    r = requests.get(url, auth=AUTH, timeout=timeout, verify=False)
+    # محاولة واحدة فقط: كل محاولة مرفوضة تُحسب على الجهاز وقد تقفله
+    r = requests.request(method, url, auth=HTTPDigestAuth(DEVICE_USER, DEVICE_PASS),
+                         timeout=timeout, verify=False, **kw)
+    if r.status_code == 401:
+        raise _auth_error(r)
+    return r
+
+
+def device_get(path: str, timeout: int = 8):
+    r = _request("GET", path, timeout)
     r.raise_for_status()
     return r
 
 
 def device_post_json(path: str, body: dict, timeout: int = 15):
-    url = BASE + path
     headers = {"Content-Type": "application/json"}
-    r = requests.post(url, auth=AUTH, headers=headers, data=json.dumps(body), timeout=timeout, verify=False)
-    r.raise_for_status()
+    r = _request("POST", path, timeout, headers=headers, data=json.dumps(body))
+    if r.status_code >= 400:
+        raise RuntimeError(f"HTTP {r.status_code} من الجهاز: {r.text.strip()[:300]}")
     # بعض الأجهزة ترجع XML رغم format=json
     text = r.text.strip()
     if text.startswith("{"):
@@ -106,8 +152,35 @@ def fetch_device_info() -> dict:
             if m:
                 info[tag] = m.group(1)
         return info
+    except DeviceAuthError as e:
+        return {"error": str(e), "auth_error": str(e), "auth_wait": e.wait}
     except Exception as e:
         return {"error": str(e)}
+
+
+clock_diff_min = None   # فرق ساعة الجهاز عن الكمبيوتر بالدقائق (موجب = الجهاز متقدم)
+
+
+def check_device_clock() -> None:
+    """يقارن ساعة الجهاز بساعة الكمبيوتر ويحذّر عند الاختلاف (أوقات الحضور تعتمد على ساعة الجهاز)."""
+    global clock_diff_min
+    try:
+        r = device_get("/ISAPI/System/time")
+        m = re.search(r"<localTime>([^<]+)</localTime>", r.text)
+        if not m:
+            return
+        raw = re.sub(r"(Z|[+-]\d{2}:\d{2})$", "", m.group(1).strip())
+        dev = datetime.fromisoformat(raw)
+        diff = (dev - datetime.now()).total_seconds() / 60.0
+        clock_diff_min = round(diff, 1)
+        if abs(diff) > 2:
+            way = "متقدمة" if diff > 0 else "متأخرة"
+            log(f"تحذير: ساعة الجهاز {way} عن الكمبيوتر بحوالي {abs(round(diff))} دقيقة — "
+                f"اضبط التاريخ والوقت من قائمة الجهاز وإلا ستكون أوقات الحضور والتأخير غير دقيقة")
+    except DeviceAuthError:
+        raise
+    except Exception:
+        pass  # بعض الموديلات لا تدعم هذا المسار
 
 
 def _local_offset() -> str:
@@ -121,46 +194,49 @@ def _local_offset() -> str:
 def fetch_acs_events(start: datetime, end: datetime) -> list[dict]:
     """سحب أحداث البصمة في فترة زمنية. start/end بالتوقيت المحلي (توقيت الجهاز)."""
     off = _local_offset()
+    PAGE = 30  # بعض الأجهزة ترفض أكثر من 30 نتيجة في الصفحة (400)
 
-    def fmt(dt: datetime) -> str:
-        return dt.strftime("%Y-%m-%dT%H:%M:%S") + off
-
+    time_formats = [
+        lambda dt: dt.strftime("%Y-%m-%dT%H:%M:%S") + off,   # مع فرق التوقيت
+        lambda dt: dt.strftime("%Y-%m-%dT%H:%M:%S"),         # بدون فرق توقيت
+    ]
     paths = [
         "/ISAPI/AccessControl/AcsEvent?format=json",
         "/ISAPI/AccessControl/AcsEvent",
     ]
-    last_err = None
-    search_id = f"att-{int(time.time())}"
+    errors = []
     for path in paths:
-        try:
-            results, pos = [], 0
-            while True:
-                body = {
-                    "AcsEventCond": {
-                        "searchID": search_id,
-                        "searchResultPosition": pos,
-                        "maxResults": 100,
-                        "major": 5,
-                        "minor": 0,
-                        "startTime": fmt(start),
-                        "endTime": fmt(end),
+        for fmt in time_formats:
+            try:
+                results, pos = [], 0
+                while True:
+                    body = {
+                        "AcsEventCond": {
+                            "searchID": "1",
+                            "searchResultPosition": pos,
+                            "maxResults": PAGE,
+                            "major": 5,
+                            "minor": 0,
+                            "startTime": fmt(start),
+                            "endTime": fmt(end),
+                        }
                     }
-                }
-                data = device_post_json(path, body)
-                batch = parse_events(data)
-                results += batch
-                ae = data.get("AcsEvent") if isinstance(data, dict) else None
-                more = isinstance(ae, dict) and str(ae.get("responseStatusStrg", "")).upper() == "MORE"
-                if not batch or not more:
-                    break
-                pos += int(ae.get("numOfMatches") or len(batch))
-                if pos > 5000:
-                    break
-            return results
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(f"تعذر سحب الأحداث: {last_err}")
+                    data = device_post_json(path, body)
+                    batch = parse_events(data)
+                    results += batch
+                    ae = data.get("AcsEvent") if isinstance(data, dict) else None
+                    more = isinstance(ae, dict) and str(ae.get("responseStatusStrg", "")).upper() == "MORE"
+                    if not batch or not more:
+                        break
+                    pos += int(ae.get("numOfMatches") or len(batch))
+                    if pos > 5000:
+                        break
+                return results
+            except DeviceAuthError:
+                raise
+            except Exception as e:
+                errors.append(f"{path.split('/')[-1]} [{fmt(start)}]: {e}")
+    raise RuntimeError("تعذر سحب الأحداث — " + " || ".join(errors[:2]))
 
 
 def parse_events(data) -> list[dict]:
@@ -246,10 +322,17 @@ def poll_loop():
     global last_poll_ok, last_poll_msg, last_poll_at, device_info
     log(f"بدء الاتصال بالجهاز {DEVICE_IP} ...")
     device_info = fetch_device_info()
+    if device_info.get("auth_error"):
+        log(f"تحذير: {device_info['auth_error']}")
+        time.sleep(device_info.get("auth_wait", 900))
+        device_info = fetch_device_info()
     if device_info.get("model") or device_info.get("deviceName"):
         log(f"الجهاز: {device_info.get('model') or device_info.get('deviceName')} | SN: {device_info.get('serialNumber', '—')}")
     else:
         log(f"تحذير: لم يُقرأ معلومات الجهاز ({device_info.get('error', '')}) — سنحاول سحب الأحداث رغم ذلك")
+
+    check_device_clock()
+    last_clock_check = time.time()
 
     # سحب أولي لآخر LOOKBACK_HOURS
     end = datetime.now() + timedelta(hours=1)
@@ -268,16 +351,25 @@ def poll_loop():
         log(f"فشل السحب الأولي: {e}")
     flush_cloud()
 
+    fails, last_err, auth_wait = 0, "", 0
     while True:
-        time.sleep(POLL_SECONDS)
+        # بعد 3 إخفاقات متتالية نبطّئ (30 ثانية)؛ وبعد رفض الدخول ننتظر المدة التي يحددها الجهاز
+        time.sleep(auth_wait or (POLL_SECONDS if fails < 3 else 30))
+        auth_wait = 0
         try:
+            if time.time() - last_clock_check > 1800:
+                check_device_clock()
+                last_clock_check = time.time()
             end = datetime.now() + timedelta(hours=1)
-            start = datetime.now() - timedelta(hours=3)  # نافذة قصيرة مستمرة
+            start = datetime.now() - timedelta(hours=12)  # نافذة مستمرة (التكرار يُتجاهل تلقائياً)
             batch = fetch_acs_events(start, end)
             n = merge_events(batch)
             last_poll_ok = True
             last_poll_msg = f"OK · إجمالي البصمات في الذاكرة: {len(events)}"
             last_poll_at = datetime.now().isoformat(timespec="seconds")
+            if fails:
+                log("عاد الاتصال بالجهاز بشكل سليم")
+            fails, last_err = 0, ""
             if n:
                 log(f"+{n} بصمة جديدة · الإجمالي {len(events)}")
             flush_cloud()
@@ -285,7 +377,13 @@ def poll_loop():
             last_poll_ok = False
             last_poll_msg = str(e)
             last_poll_at = datetime.now().isoformat(timespec="seconds")
-            log(f"خطأ في السحب: {e}")
+            fails += 1
+            if isinstance(e, DeviceAuthError):
+                auth_wait = e.wait
+            # لا نكرر نفس الرسالة كل 5 ثوانٍ: نطبعها عند تغيّرها أو كل 10 إخفاقات
+            if str(e) != last_err or fails % 10 == 0:
+                log(f"خطأ في السحب ({fails}): {e}")
+                last_err = str(e)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -316,10 +414,12 @@ class Handler(BaseHTTPRequestHandler):
                 "device_ip": DEVICE_IP,
                 "device": device_info,
                 "events_count": len(events),
+                "clock_diff_min": clock_diff_min,
                 "cloud": bool(cloud and cloud.enabled),
                 "cloud_ok": bool(cloud and cloud.ok),
                 "cloud_msg": cloud.msg if cloud else "",
                 "pending": len(dirty),
+                "unmatched": sorted(cloud.unmatched.keys()) if cloud else [],
                 "poll_seconds": POLL_SECONDS,
             }
             return self._json(200, body)
@@ -371,7 +471,7 @@ def main():
     if cloud.enabled:
         log("الرفع المباشر للنظام: مفعّل — أي بصمة تظهر في النظام تلقائياً")
     else:
-        log("الرفع المباشر للنظام: غير مفعّل (أنشئ bridge_config.json من bridge_config.example.json)")
+        log("الرفع المباشر للنظام: غير مفعّل — السبب: " + cloud.msg)
 
     t = threading.Thread(target=poll_loop, daemon=True)
     t.start()

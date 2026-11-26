@@ -20,11 +20,16 @@ SOURCE_LABEL = "Hikvision سحابي"
 
 
 def _read_json(path):
+    """يرجع (البيانات, سبب الفشل أو None)."""
     try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, ValueError):
-        return {}
+        with open(path, encoding="utf-8-sig") as f:
+            return json.load(f), None
+    except FileNotFoundError:
+        return {}, f"الملف bridge_config.json غير موجود في {os.path.dirname(path)} (تأكد أن الاسم صحيح وليس bridge_config.json.txt)"
+    except ValueError as e:
+        return {}, f"الملف bridge_config.json غير صالح ({e}) — تأكد أن كل قيمة بين علامتي \" \" وبينها فواصل"
+    except OSError as e:
+        return {}, f"تعذر قراءة bridge_config.json: {e}"
 
 
 def _read_app_config():
@@ -57,7 +62,7 @@ class CloudSync:
     def __init__(self, log=print):
         self.log = log
         app = _read_app_config()
-        cfg = _read_json(os.path.join(HERE, "bridge_config.json"))
+        cfg, cfg_err = _read_json(os.path.join(HERE, "bridge_config.json"))
         self.url = (os.environ.get("SUPABASE_URL") or cfg.get("supabase_url") or app.get("SUPABASE_URL") or "").rstrip("/")
         self.key = os.environ.get("SUPABASE_ANON_KEY") or cfg.get("supabase_anon_key") or app.get("SUPABASE_ANON_KEY") or ""
         self.email = os.environ.get("BRIDGE_EMAIL") or cfg.get("email") or ""
@@ -70,7 +75,19 @@ class CloudSync:
 
         self.enabled = bool(self.url and self.key and self.email and self.password)
         self.ok = False
-        self.msg = "غير مفعّل — أنشئ bridge_config.json" if not self.enabled else "لم يبدأ بعد"
+        if self.enabled:
+            self.msg = "لم يبدأ بعد"
+        elif cfg_err:
+            self.msg = cfg_err
+        elif not (self.url and self.key):
+            self.msg = "تعذر قراءة رابط النظام من ../js/config.js (انسخ مجلد Rasied-main كاملاً)"
+        elif not self.email or not self.password:
+            self.msg = "البريد أو كلمة المرور فارغان في bridge_config.json"
+        else:
+            self.msg = "إعداد غير مكتمل"
+        if self.password.startswith("اكتب-هنا"):
+            self.enabled = False
+            self.msg = "لم تكتب كلمة مرور النظام في bridge_config.json (ما زالت الجملة العربية)"
         self._token = None
         self._refresh = None
         self._exp = 0
@@ -78,7 +95,8 @@ class CloudSync:
         self._uid = None
         self._emps = []
         self._emps_at = 0
-        self._warned = set()
+        self._warned = {}
+        self.unmatched = {}   # رقم البصمة -> عدد البصمات المعلّقة
 
     # ───────────── الاتصال ─────────────
     def _auth_call(self, grant, body):
@@ -145,8 +163,8 @@ class CloudSync:
         return self._company
 
     # ───────────── الموظفون ─────────────
-    def _employees(self):
-        if self._emps and time.time() - self._emps_at < 300:
+    def _employees(self, force=False):
+        if not force and self._emps and time.time() - self._emps_at < 300:
             return self._emps
         cid = self._get_company()
         out, start = [], 0
@@ -168,11 +186,19 @@ class CloudSync:
         fp = str(fp or "").strip()
         if not fp:
             return None
-        for r in self._employees():
-            d = r.get("data") or {}
-            if str(d.get("fp_id") or d.get("fingerprint_id") or d.get("code") or "").strip() == fp or str(r["id"]) == fp:
-                return r
-        return None
+        def find(rows):
+            for r in rows:
+                d = r.get("data") or {}
+                if str(d.get("fp_id") or d.get("fingerprint_id") or d.get("code") or "").strip() == fp or str(r["id"]) == fp:
+                    return r
+            return None
+        r = find(self._employees())
+        if r:
+            return r
+        # لم نجده: ربما رُبط الرقم للتو في بطاقة الموظف — أعد تحميل القائمة (بحد أقصى مرة كل 10 ثوانٍ)
+        if time.time() - self._emps_at > 10:
+            r = find(self._employees(force=True))
+        return r
 
     # ───────────── حساب الحالة (مطابق لصفحة الحضور) ─────────────
     def _calc(self, check_in, check_out):
@@ -198,13 +224,16 @@ class CloudSync:
         try:
             cid = self._get_company()
             groups = {}
+            self.unmatched = {}
             for ev in events:
                 emp = self._emp_by_fp(ev.get("employeeNo"))
                 if not emp:
                     no = ev.get("employeeNo") or ""
-                    if no and no not in self._warned:
-                        self._warned.add(no)
-                        self.log(f"تنبيه: رقم بصمة {no} غير مربوط بموظف — اكتبه في بطاقة الموظف (رقم البصمة)")
+                    if no:
+                        self.unmatched[no] = self.unmatched.get(no, 0) + 1
+                        if time.time() - self._warned.get(no, 0) > 600:
+                            self._warned[no] = time.time()
+                            self.log(f"تنبيه: رقم بصمة {no} غير مربوط بموظف — اكتبه في بطاقة الموظف (رقم البصمة)")
                     continue  # يبقى معلّقاً حتى يُربط
                 date, clock = ev.get("date"), ev.get("clock")
                 if not date or not clock:

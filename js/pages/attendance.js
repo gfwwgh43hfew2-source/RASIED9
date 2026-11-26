@@ -88,6 +88,7 @@
       if (st.cloud) {
         // الجسر يرفع البصمات للنظام مباشرة — الصفحة تكتفي بإعادة القراءة
         if (!st.cloud_ok) setBridgeStatus(false, "الجسر لا يستطيع الرفع للنظام: " + (st.cloud_msg || ""));
+        else if (st.unmatched && st.unmatched.length) setBridgeStatus(false, "بصمات لأرقام غير مربوطة بموظف: " + st.unmatched.join("، ") + " — اكتب الرقم في بطاقة الموظف (رقم البصمة)");
         else if (st.pending) setBridgeStatus(true, "بصمات بانتظار الرفع: " + st.pending);
         return;
       }
