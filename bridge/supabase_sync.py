@@ -164,7 +164,8 @@ class CloudSync:
 
     # ───────────── الموظفون ─────────────
     def _employees(self, force=False):
-        if not force and self._emps and time.time() - self._emps_at < 300:
+        # مدة قصيرة (15ث) كي لا تُنسب البصمات لموظف حُذف/أُعيد إنشاؤه (يتغيّر id) وتصبح سجلات يتيمة لا تظهر في الصفحة
+        if not force and self._emps and time.time() - self._emps_at < 15:
             return self._emps
         cid = self._get_company()
         out, start = [], 0
@@ -257,7 +258,8 @@ class CloudSync:
                 existing = by_date[date].get(eid)
                 ex = (existing or {}).get("data") or {}
                 seen = set(ex.get("punches") or [])
-                new_times = sorted({t for t in g["times"] if t not in seen})
+                removed = set(ex.get("removed_punches") or [])   # بصمات حذفها المستخدم من الصفحة — لا تُعاد
+                new_times = sorted({t for t in g["times"] if t not in seen and t not in removed})
                 if existing and not new_times:
                     done.update(g["keys"])
                     continue

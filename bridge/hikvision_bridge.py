@@ -168,6 +168,7 @@ def check_device_clock() -> None:
         r = device_get("/ISAPI/System/time")
         m = re.search(r"<localTime>([^<]+)</localTime>", r.text)
         if not m:
+            log("تنبيه: الجهاز لم يُرجع ساعته (/ISAPI/System/time) — تعذر مقارنة ساعته بالكمبيوتر؛ راجع وقت الجهاز يدوياً")
             return
         raw = re.sub(r"(Z|[+-]\d{2}:\d{2})$", "", m.group(1).strip())
         dev = datetime.fromisoformat(raw)

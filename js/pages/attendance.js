@@ -27,19 +27,6 @@
       <div class="row gap wrap" style="align-items:center;margin-bottom:4px">
         <div id="bridge-status"><span class="badge">○ جاري فحص الاتصال بالبصمة...</span></div>
       </div>
-      <div class="card" style="padding:12px 16px;background:var(--surface-2)">
-        <div style="font-size:12.5px;line-height:1.7">
-          <b>البصمة المباشرة (Hikvision DS-K1A8603EF):</b>
-          <ol style="margin:6px 0 0;padding-inline-start:20px">
-            <li>وصّل الجهاز والكمبيوتر على <b>نفس الراوتر</b>.</li>
-            <li>على الكمبيوتر شغّل ملف الجسر: <code>bridge/hikvision_bridge.py</code> (بعد تعديل IP الجهاز).</li>
-            <li>بمجرد ما الموظف يبصم → ينزل تلقائياً هنا خلال ثوانٍ.</li>
-            <li>تأكد أن <b>رقم البصمة</b> في بطاقة الموظف = Employee No على الجهاز.</li>
-            <li>بديل: زر «استيراد من البصمة» لرفع ملف CSV من iVMS-4200.</li>
-          </ol>
-        </div>
-      </div>
-
       <div class="seg" id="seg">
         <button type="button" class="on" data-v="day">تسجيل اليوم</button>
         <button type="button" data-v="month">ملخص الشهر</button>
@@ -198,7 +185,7 @@
       <div class="stat red"><div class="label">غائب</div><div class="value">${cnt.absent}</div></div>
       <div class="stat"><div class="label">لم يُسجَّل</div><div class="value">${cnt.none}</div></div>`;
     document.getElementById("tbl").innerHTML = html`
-      <table><thead><tr><th>الموظف</th><th>رقم البصمة</th><th>الحالة</th><th>حضور</th><th>انصراف</th><th>تأخير (د)</th><th>إضافي (د)</th><th>ملاحظات</th></tr></thead><tbody>
+      <table><thead><tr><th>الموظف</th><th>رقم البصمة</th><th>الحالة</th><th>حضور</th><th>انصراف</th><th>تأخير (د)</th><th>إضافي (د)</th><th>البصمات</th><th>ملاحظات</th></tr></thead><tbody>
         ${active.map(function (e) {
           var r = rec(e.id, d) || {};
           return html`<tr data-e="${e.id}">
@@ -211,9 +198,10 @@
             <td><input type="time" data-k="check_out" value="${r.check_out || ""}"></td>
             <td dir="ltr">${r.late_min || 0}</td>
             <td dir="ltr">${r.ot_min || 0}</td>
+            <td><button type="button" class="small" data-punches="${e.id}">${(r.punches || []).length} بصمة · تعديل</button></td>
             <td><input data-k="notes" value="${esc(r.notes || "")}" placeholder="ملاحظة"></td>
           </tr>`;
-        }).join("") || html`<tr><td colspan="8" class="empty">لا يوجد موظفون. أضفهم من صفحة الموظفين وضع رقم البصمة.</td></tr>`}
+        }).join("") || html`<tr><td colspan="9" class="empty">لا يوجد موظفون. أضفهم من صفحة الموظفين وضع رقم البصمة.</td></tr>`}
       </tbody></table>`;
   }
 
@@ -470,6 +458,49 @@
     } catch (err) {
       UI.toast(err.message, true);
     }
+  });
+
+
+  // —— تعديل/حذف بصمات موظف في يوم معيّن ——
+  function punchRowHtml(t) {
+    return '<div class="row gap pn-row" style="align-items:center;margin-bottom:6px">' +
+      '<input type="time" class="pn-t" value="' + esc(t || "") + '">' +
+      '<button type="button" class="small ghost pn-del">حذف</button></div>';
+  }
+  function openPunches(empId) {
+    var d = val("day"), e = emps.find(function (x) { return x.id === empId; });
+    var r = rec(empId, d) || {};
+    var list = (r.punches && r.punches.length) ? r.punches.slice() : [r.check_in, r.check_out].filter(Boolean);
+    list = Array.from(new Set(list)).sort();
+    var m = UI.modal({
+      title: "بصمات " + (e ? e.name : "") + " · " + d,
+      body: '<div id="pn-list">' + list.map(punchRowHtml).join("") + '</div>' +
+        '<button type="button" class="small" id="pn-add">+ إضافة بصمة</button>' +
+        '<p class="muted" style="font-size:12px;margin:8px 0 0">أول بصمة = حضور، آخر بصمة = انصراف. البصمة المحذوفة لن يعيدها الجسر مرة أخرى.</p>',
+      ok: "حفظ",
+      onOk: async function (ov) {
+        var times = Array.from(ov.querySelectorAll(".pn-t")).map(function (i) { return i.value; }).filter(Boolean);
+        times = Array.from(new Set(times)).sort();
+        var removed = Array.from(new Set((r.removed_punches || []).concat(list.filter(function (t) { return times.indexOf(t) === -1; }))))
+          .filter(function (t) { return times.indexOf(t) === -1; });
+        var ci = times[0] || "", co = times.length > 1 ? times[times.length - 1] : "";
+        var calc = calcStatus(ci, co);
+        var patch = { punches: times, removed_punches: removed, check_in: ci, check_out: co,
+          status: ci ? calc.status : (r.status === "leave" ? "leave" : "absent"), late_min: calc.late_min, ot_min: calc.ot_min };
+        await save(empId, d, patch);
+        UI.toast("تم حفظ البصمات");
+        drawDay();
+      },
+    });
+    m.el.addEventListener("click", function (ev) {
+      if (ev.target.id === "pn-add") m.el.querySelector("#pn-list").insertAdjacentHTML("beforeend", punchRowHtml(""));
+      var del = ev.target.closest(".pn-del");
+      if (del) del.closest(".pn-row").remove();
+    });
+  }
+  document.getElementById("tbl").addEventListener("click", function (e) {
+    var b = e.target.closest("[data-punches]");
+    if (b) openPunches(b.getAttribute("data-punches"));
   });
 
   document.getElementById("seg").onclick = function (e) {
