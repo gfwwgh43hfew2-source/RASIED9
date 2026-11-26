@@ -482,6 +482,10 @@ tr:has(> td.empty):hover { background: transparent; }
 .field { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
 .field label { font-size: 12.5px; font-weight: 700; color: var(--text-2); }
 .field.full { grid-column: 1 / -1; }
+/* نماذج النوافذ المنبثقة التي تستخدم <label> مباشرة داخل .form-grid */
+.form-grid > label { display: flex; flex-direction: column; gap: 7px; min-width: 0; font-size: 12.5px; font-weight: 700; color: var(--text-2); }
+.form-grid > .full { grid-column: 1 / -1; }
+.modal .modal-body input, .modal .modal-body select, .modal .modal-body textarea { width: 100%; }
 .toolbar-search, #q { max-width: 420px; }
 
 .modal-overlay {

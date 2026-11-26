@@ -36,6 +36,45 @@
     return new Date(d).toLocaleDateString("ar-EG-u-nu-latn", opts || { day: "numeric", month: "short" });
   }
 
+  // نافذة حوار عامة: UI.modal({ title, body, ok, cancel, onOk })
+  // onOk قد تكون async؛ إرجاع false أو رمي خطأ يُبقي النافذة مفتوحة.
+  function modal(opts) {
+    opts = opts || {};
+    var ov = document.createElement("div");
+    ov.className = "modal-overlay";
+    ov.innerHTML =
+      '<div class="modal card" role="dialog" aria-modal="true">' +
+      '<h3 style="margin-top:0"></h3><div class="modal-body"></div>' +
+      '<div class="row gap" style="justify-content:flex-end;margin-top:14px">' +
+      '<button type="button" class="ghost" data-cancel></button>' +
+      '<button type="button" class="primary" data-ok></button></div></div>';
+    ov.querySelector("h3").textContent = opts.title || "";
+    ov.querySelector(".modal-body").innerHTML = opts.body || "";
+    var okBtn = ov.querySelector("[data-ok]"), cancelBtn = ov.querySelector("[data-cancel]");
+    okBtn.textContent = opts.ok || "حفظ";
+    cancelBtn.textContent = opts.cancel || "إلغاء";
+    function close() { ov.remove(); document.removeEventListener("keydown", onKey); }
+    function onKey(e) { if (e.key === "Escape") close(); }
+    document.addEventListener("keydown", onKey);
+    cancelBtn.onclick = close;
+    ov.onclick = function (e) { if (e.target === ov) close(); };
+    okBtn.onclick = async function () {
+      okBtn.disabled = true;
+      try {
+        var r = opts.onOk ? await opts.onOk(ov) : undefined;
+        if (r === false) { okBtn.disabled = false; return; }
+        close();
+      } catch (err) {
+        toast((err && err.message) || "حدث خطأ", true);
+        okBtn.disabled = false;
+      }
+    };
+    document.body.appendChild(ov);
+    var first = ov.querySelector("input,select,textarea");
+    if (first) first.focus();
+    return { close: close, el: ov };
+  }
+
   function toast(msg, isErr) {
     var d = document.createElement("div");
     d.className = "toast " + (isErr ? "error" : "ok");
@@ -1215,6 +1254,7 @@
     typeLabel: typeLabel,
     exportCSV: exportCSV,
     printHTML: printHTML,
+    modal: modal,
     ICON: ICON,
     svg: svg,
     clearShellCache: clearShellCache,
