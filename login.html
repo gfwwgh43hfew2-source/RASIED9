@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=5" />
+    <meta name="theme-color" content="#182763" />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="apple-touch-icon" href="assets/img/apple-touch-icon.png" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="رصيد" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+    <title>تسجيل الدخول — نظام رصيد Rasied</title>
+    <link rel="icon" href="favicon.ico" sizes="any" />
+    <link rel="stylesheet" href="css/style.css?v=59" />
+  </head>
+  <body class="auth-body">
+    <div class="auth-shell">
+      <aside class="auth-hero">
+        <div class="auth-brand"><img class="brand-logo" src="assets/img/logo-128.png" width="52" height="52" alt="Rasied" /><b>نظام رصيد Rasied</b></div>
+        <div class="auth-hero-body">
+          <h1>أدِر تجارتك بالكامل<br />من مكان واحد</h1>
+          <p>مبيعات ومشتريات ومخزون وخزائن وحسابات وتقارير — بيانات شركتك معزولة ومحمية بالكامل.</p>
+          <ul class="auth-points">
+            <li><i></i>فواتير بضريبة وطباعة احترافية</li>
+            <li><i></i>مخزون ومخازن وجرد وتحويلات</li>
+            <li><i></i>قيود يومية وميزان مراجعة تلقائي</li>
+            <li><i></i>حساب خاص بشركتك برقم هاتفك</li>
+          </ul>
+        </div>
+        <div class="auth-foot">© نظام رصيد Rasied</div>
+      </aside>
+
+      <main class="auth-main">
+        <div class="auth-card card">
+          <div style="text-align:end"><button type="button" class="ghost small" id="lang-login" onclick="I18n.toggle()">English</button></div>
+          <div class="seg auth-tabs" role="tablist">
+            <button type="button" role="tab" id="tab-login" class="on">تسجيل الدخول</button>
+            <button type="button" role="tab" id="tab-reg">حساب جديد</button>
+          </div>
+
+          <form id="form-login" class="stack" novalidate>
+            <div><h2 class="auth-h">أهلاً بعودتك 👋</h2><p class="muted" style="margin:4px 0 0">ادخل برقم هاتفك وكلمة المرور</p></div>
+            <div class="field"><label for="l-phone">رقم الهاتف</label><input id="l-phone" type="tel" inputmode="tel" dir="ltr" autocomplete="username" placeholder="مثال: 966501234567" required /></div>
+            <div class="field"><label for="l-pass">كلمة المرور</label><div class="pw"><input id="l-pass" type="password" dir="ltr" autocomplete="current-password" required /><button type="button" class="ghost pw-eye" data-eye="l-pass" aria-label="إظهار">👁</button></div></div>
+            <div style="text-align:end;margin-top:-6px"><button type="button" class="ghost small" id="forgot">نسيت كلمة المرور؟</button></div>
+            <div class="auth-err" id="err-login" role="alert" hidden></div>
+            <button class="primary auth-submit" type="submit" id="btn-login">دخول</button>
+          </form>
+
+          <form id="form-reg" class="stack" novalidate hidden>
+            <div><h2 class="auth-h">إنشاء حساب جديد</h2><p class="muted" style="margin:4px 0 0">سيكون لشركتك حساب وبيانات خاصة بها</p></div>
+            <div class="form-grid" style="grid-template-columns:1fr 1fr">
+              <div class="field"><label for="r-name">اسمك</label><input id="r-name" autocomplete="name" required /></div>
+              <div class="field"><label for="r-co">اسم الشركة</label><input id="r-co" autocomplete="organization" required /></div>
+            </div>
+            <div class="field"><label for="r-phone">رقم الهاتف (يُستخدم لتسجيل الدخول)</label><input id="r-phone" type="tel" inputmode="tel" dir="ltr" autocomplete="username" placeholder="مع كود الدولة، مثال: 966501234567" required /></div>
+            <div class="field"><label for="r-pass">كلمة المرور (6 أحرف على الأقل)</label><div class="pw"><input id="r-pass" type="password" dir="ltr" autocomplete="new-password" minlength="6" required /><button type="button" class="ghost pw-eye" data-eye="r-pass" aria-label="إظهار">👁</button></div></div>
+            <div class="auth-err" id="err-reg" role="alert" hidden></div>
+            <button class="primary auth-submit" type="submit" id="btn-reg">إنشاء الحساب</button>
+          </form>
+        </div>
+      </main>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.45.4/dist/umd/supabase.js"></script>
+    <script src="js/config.js?v=59"></script>
+    <script src="js/i18n.js?v=59"></script>
+    <script src="js/i18n-en.js?v=59"></script>
+    <script src="js/i18n-en2.js?v=59"></script>
+    <script src="js/i18n-en3.js?v=59"></script>
+    <script src="js/i18n-en4.js?v=59"></script>
+    <script src="js/i18n-en5.js?v=59"></script>
+    <script src="js/i18n-en6.js?v=59"></script>
+    <script>document.getElementById("lang-login").textContent = I18n.isEn() ? "عربي" : "English";</script>
+    <script src="js/login.js?v=59"></script>
+      <script defer src="js/pwa.js?v=59"></script>
+  </body>
+</html>
