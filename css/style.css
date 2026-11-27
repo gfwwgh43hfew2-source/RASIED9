@@ -1304,3 +1304,34 @@ html.dark mark{background:#854d0e}
 .cw-src-a:hover { background: var(--primary-muted); }
 .cw-src-t { overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 .cw-src-d { font-size: 11px; color: var(--muted); direction: ltr; text-align: start; }
+
+/* ---------- ترتيب الشريط العلوي: بلا التفاف ولا تداخل ---------- */
+.topbar-title { flex: 1 1 0; min-width: 0; overflow: hidden; }
+.topbar-end { flex: none; }
+.breadcrumb { flex-wrap: nowrap; white-space: nowrap; overflow: hidden; }
+.breadcrumb > * { flex: none; }
+.breadcrumb .bc-current { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.topbar h1 { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* مساحة المحتوى = العرض − القائمة الجانبية (272px)، فنخفّي العناصر الثانوية تدريجيًا */
+@media (max-width: 1500px) and (min-width: 901px) {
+  .clock { display: none; }
+  .top-search { min-width: 0; width: 42px; padding: 0; justify-content: center; }
+  .top-search span, .top-search .kbd { display: none; }
+}
+@media (max-width: 1180px) and (min-width: 901px) {
+  .topbar-end .badge { display: none; }
+  .user-chip .un { display: none; }
+  .user-chip { padding: 4px; }
+}
+@media (max-width: 1040px) and (min-width: 901px) {
+  .topbar { padding-inline: 18px; }
+}
+
+/* موبايل: صف للعنوان بعرض كامل وصف للأزرار */
+@media (max-width: 640px) {
+  .topbar { flex-wrap: wrap; row-gap: 6px; }
+  .topbar-title { flex: 1 1 calc(100% - 56px); }
+  .topbar-end { flex: 1 0 100%; justify-content: flex-end; flex-wrap: wrap; }
+  .top-search, .topbar-end .badge, .user-chip .un { display: none; }
+}
